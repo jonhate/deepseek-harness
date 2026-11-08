@@ -743,7 +743,18 @@ export function apply(ctx: Context): void {
       if (agent === undefined || (exec.parent === undefined && exec.name === RUN_CODE_NAME)) {
         return next()
       }
-      if (permissionPresets.current(agent.session) !== AUTO_PRESET) {
+      // The permission projection can be unavailable while the plugin tree is
+      // reloading: cordis then reports "cannot get required service
+      // sessionProjections in inactive context". Treat that as "not Auto" and
+      // fall through to the existing approval chain — otherwise this prepended
+      // listener fails every tool call in the session.
+      let preset: string | undefined
+      try {
+        preset = permissionPresets.current(agent.session)
+      } catch {
+        preset = undefined
+      }
+      if (preset !== AUTO_PRESET) {
         return next()
       }
       if (!accepting || lifecycle.signal.aborted) {
@@ -759,12 +770,25 @@ export function apply(ctx: Context): void {
           shown = new Map()
           shownBySession.set(agent.session, shown)
         }
-        const review = await classifyRisk(ctx, agent, exec, signal, shown).then(
+        const attempt = () => classifyRisk(ctx, agent, exec, signal, shown).then(
           decision => ({ ok: true as const, decision }),
           (error: unknown) => ({ ok: false as const, error }),
         )
+        let review = await attempt()
+        // A truncated or otherwise unusable reviewer response is a transport
+        // artefact, not a verdict on the pending call: retry once before
+        // treating the review as failed.
+        if (!review.ok && !isAborted(lifecycle.signal)) {
+          review = await attempt()
+        }
         if (isAborted(lifecycle.signal)) return { kind: 'cancel' }
-        if (!review.ok) return failed(exec, review.error)
+        if (!review.ok) {
+          // Never let a reviewer outage deny a call outright. Under the `ask`
+          // policy the user decides; only `never` keeps a hard denial.
+          return ctx.approval.overrideOf(agent.session) === 'never'
+            ? failed(exec, review.error)
+            : askUser(exec, 'auto review unavailable')
+        }
         const { decision } = review
         // The permission owner pins an approval policy into every published Session.
         if (decision.decision === 'deny' && ctx.approval.overrideOf(agent.session) === 'never') {
